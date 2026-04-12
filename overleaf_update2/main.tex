@@ -118,11 +118,15 @@ Adapting EAGLE to Apple Silicon required five categories of modifications to the
 %==============================================================================
 
 \subsection{Models}
-Due to hardware constraints (see Section~\ref{sec:problems}), we pivoted from our originally proposed Med-Gemma \citep{medgemma2024} models to the Qwen family \citep{qwen2024}, which provides efficient, high-quality models at manageable sizes:
+We evaluate two model families. For speculative decoding comparisons, we use the Qwen family \citep{qwen2024}:
 \begin{itemize}
     \item \textbf{Target Model:} \texttt{Qwen/Qwen3-1.7B} (1.7B parameters)
     \item \textbf{Draft Model:} \texttt{Qwen/Qwen2.5-0.5B} (0.5B parameters) for vanilla speculative decoding
     \item \textbf{EAGLE Model:} \texttt{AngelSlim/Qwen3-1.7B\_eagle3} (EAGLE-3 weights for Qwen3-1.7B)
+\end{itemize}
+Additionally, we benchmark Med-Gemma \citep{medgemma2024}, a domain-specific medical foundation model built on the Gemma~3 architecture:
+\begin{itemize}
+    \item \textbf{Med-Gemma 4B:} \texttt{google/medgemma-4b-it} (4B parameters, instruction-tuned)
 \end{itemize}
 All models are loaded in \texttt{float16} precision with \texttt{device\_map} set to the target accelerator.
 
@@ -142,20 +146,22 @@ Table~\ref{tab:results} summarizes our benchmarking results on Apple Silicon (MP
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lcc}
+\begin{tabular}{lccc}
 \toprule
-\textbf{Method} & \textbf{Tokens/sec} & \textbf{Relative} \\
+\textbf{Method} & \textbf{Model} & \textbf{Tokens/sec} & \textbf{Relative} \\
 \midrule
-Vanilla LLM & 44.17 & 1.00$\times$ \\
-Vanilla Speculative & 30.38 & 0.69$\times$ \\
-EAGLE-3 & 9.07 & 0.21$\times$ \\
+Vanilla LLM & Qwen3-1.7B & 44.17 & 1.00$\times$ \\
+Vanilla Speculative & Qwen3-1.7B & 30.38 & 0.69$\times$ \\
+EAGLE-3 & Qwen3-1.7B & 9.07 & 0.21$\times$ \\
+\midrule
+Vanilla LLM & Med-Gemma 4B & 20.47 & --- \\
 \bottomrule
 \end{tabular}
-\caption{Generation throughput on Apple Silicon (MPS) with Qwen3-1.7B. Speculative methods show \textit{slowdowns} rather than speedups due to the Unified Memory Architecture.}
+\caption{Generation throughput on Apple Silicon (MPS). Top: Qwen3-1.7B with speculative methods showing \textit{slowdowns} due to the Unified Memory Architecture. Bottom: Med-Gemma 4B baseline for cross-model comparison.}
 \label{tab:results}
 \end{table}
 
-Contrary to the expected $2$--$3\times$ speedup, both speculative decoding variants are \textit{slower} than vanilla autoregressive generation on this hardware. The vanilla speculative method achieves only $0.69\times$ the baseline throughput, while EAGLE-3 achieves only $0.21\times$.
+Contrary to the expected $2$--$3\times$ speedup, both speculative decoding variants are \textit{slower} than vanilla autoregressive generation on this hardware. The vanilla speculative method achieves only $0.69\times$ the baseline throughput, while EAGLE-3 achieves only $0.21\times$. Med-Gemma 4B achieves 20.47 tokens/sec in vanilla mode, serving as a baseline for future speculative decoding experiments with domain-specific medical models.
 
 \subsection{Analysis and Ablation Studies Completed}
 
@@ -196,6 +202,7 @@ Since Project Update~1, we have made the following progress:
     \item \textbf{Experimental Setup:} Added a dedicated Experimental Setup section (Section~4) with model specifications, hardware details, and evaluation protocol.
     \item \textbf{Introduction:} Wrote a complete Introduction section (Section~1) framing the problem and our contributions.
     \item \textbf{Results analysis:} Deepened the analysis of current results with formal discussion of UMA bottleneck effects, CUDA dependency impacts, and draft model mismatch effects.
+    \item \textbf{Med-Gemma 4B benchmarking:} Successfully loaded and benchmarked \texttt{google/medgemma-4b-it} (4B parameters) on Apple Silicon MPS, achieving 20.47 tokens/sec in vanilla autoregressive mode.
 \end{enumerate}
 
 %==============================================================================
@@ -203,8 +210,8 @@ Since Project Update~1, we have made the following progress:
 \label{sec:problems}
 %==============================================================================
 
-\paragraph{Med-Gemma Evaluation.}
-Our original proposal planned to evaluate speculative decoding on Med-Gemma \citep{medgemma2024} for medical NLP tasks. However, Med-Gemma models require significantly more GPU memory than available on our local hardware. The models could not be loaded even in \texttt{float16} precision on Apple Silicon with 16GB unified memory. We pivoted to the Qwen model family, which provides competitive quality at manageable sizes (0.5B--1.7B parameters).
+\paragraph{Med-Gemma Initial Attempt.}
+Our original proposal planned to evaluate speculative decoding on Med-Gemma \citep{medgemma2024} for medical NLP tasks. Initial attempts to load Med-Gemma failed due to gated repository access restrictions and dependency version conflicts. After resolving authentication and upgrading the HuggingFace pipeline, we successfully loaded and benchmarked \texttt{google/medgemma-4b-it} (4B parameters) on Apple Silicon MPS, achieving 20.47 tokens/sec. While Med-Gemma is now functional for vanilla inference, applying speculative decoding to it remains a challenge: no pre-trained EAGLE weights exist for Gemma-3-based architectures, and finding an appropriate smaller draft model within the same architecture family is an open problem we plan to address.
 
 \paragraph{Direct EAGLE Port to MPS.}
 We initially attempted to run the EAGLE framework unmodified on MPS, expecting PyTorch's device abstraction to handle the CUDA-to-MPS translation. This failed immediately due to five distinct categories of incompatibilities (detailed in Section~3.3). While we successfully patched all issues, the resulting throughput was significantly worse than vanilla decoding, demonstrating that speculative decoding frameworks require hardware-specific optimization to be effective.
@@ -222,7 +229,7 @@ Using \texttt{Qwen2.5-0.5B} as a draft model for \texttt{Qwen3-1.7B} resulted in
     \item \textbf{Acceptance rate profiling:} Instrument the speculative sampling loop to record per-token acceptance rates and analyze the relationship between $\alpha$, $\gamma$, and throughput.
     \item \textbf{Same-family draft models:} Test with architecturally matched draft-target pairs (e.g., Qwen3-0.6B with Qwen3-1.7B) to improve acceptance rates.
     \item \textbf{Hardware comparison study:} Run identical configurations on MPS and CUDA to produce a direct hardware comparison, quantifying the UMA effect.
-    \item \textbf{Med-Gemma revisit:} Attempt Med-Gemma evaluation on the Gilbreth cluster if sufficient VRAM is available.
+    \item \textbf{Med-Gemma speculative decoding:} Investigate draft model candidates for Med-Gemma 4B (e.g., Gemma-3-1B or distilled variants) to enable speculative decoding benchmarks on a domain-specific medical model.
 \end{enumerate}
 
 %==============================================================================
