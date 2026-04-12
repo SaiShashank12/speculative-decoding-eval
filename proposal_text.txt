@@ -1,0 +1,314 @@
+Fast Inference from Transformers via Speculative Decoding:
+Implementation and Evaluation
+Sai Shashank Mudliar
+Purdue University
+smudliar@purdue.edu
+Abstract
+Large autoregressive Transformer models
+achieve superior performance but suffer from
+slow inference, as decodingKtokens requires
+Kserial forward passes. This project proposes
+to implement and evaluate speculative decod-
+ing, a novel algorithm that accelerates infer-
+ence by 2–3×without modifying model archi-
+tectures or changing output distributions. The
+method uses smaller approximation models to
+generate candidate tokens in parallel, which
+are then verified by the target model using a
+novel speculative sampling technique. We will
+implement the algorithm, evaluate it on trans-
+lation and summarization tasks, and analyze
+the trade-offs between speedup and computa-
+tional overhead.
+1 Motivation
+Large autoregressive Transformer models such as
+GPT-3 (Brown et al., 2020), T5-XXL (Raffel et al.,
+2020), and LaMDA (Thoppilan et al., 2022) have
+demonstrated remarkable capabilities across var-
+ious natural language processing tasks. However,
+inference from these models is inherently slow be-
+cause each token generation requires a sequential
+forward pass through the model. For a sequence
+ofKtokens, this results inKserial model runs,
+making real-time applications challenging.
+Traditional approaches to accelerate inference
+face significant limitations. Quantization and
+pruning methods (Hubara et al., 2016) reduce
+computation uniformly but may degrade output
+quality. Adaptive computation methods (Schus-
+ter et al., 2021) that use less compute for easier
+steps require architecture changes and model re-
+training. Most critically, these methods do not
+guarantee identical output distributions, which is
+essential for maintaining model behavior in pro-
+duction systems.
+The key insight from Leviathan et al.
+(Leviathan et al., 2022) is that hard language
+modeling tasks often contain easier subtasks
+that can be approximated well by smaller, more
+efficient models. Additionally, when memory
+bandwidth is the bottleneck rather than arithmetic
+operations, additional computational resources
+may be available for parallel execution. This
+motivates the use of speculative execution,
+a well-established optimization technique in
+computer architecture (Hennessy and Patterson,
+2011), generalized to the stochastic setting of
+autoregressive generation.
+Speculative decoding offers a promising solu-
+tion that addresses these limitations: it can accel-
+erate existing off-the-shelf models without retrain-
+ing, maintains identical output distributions, and
+achieves substantial speedups (2–3×as demon-
+strated on T5-XXL). This makes it particularly
+valuable for deploying large models in production
+environments where both speed and output fidelity
+are critical.
+2 Problem Statement
+Formally, we address the following problem:
+Given a large autoregressive modelMp with prob-
+ability distributionp(x t|x<t)over tokens at po-
+sitiont, and a smaller approximation modelM q
+with distributionq(x t|x<t), how can we generate
+tokens fromM p faster than standard autoregres-
+sive decoding while ensuring that the output dis-
+tribution remains exactlyp(·)?
+Standard autoregressive decoding generates to-
+kens sequentially: for each positiont, we compute
+p(xt|x<t)and samplex t ∼p(·|x <t), requiringK
+serial forward passes forKtokens. The compu-
+tational complexity isO(K·C p)whereC p is the
+cost of a single forward pass throughM p.
+The challenge is to leverage the approximation
+modelM q to generate multiple candidate tokens
+in parallel, then efficiently verify and correct these
+candidates usingM p such that: (1) the final out-
+put distribution matchesp(·)exactly, (2) the ex-
+pected number of forward passes throughM p is
+reduced, and (3) the method works with any pre-
+trained models without modification.
+3 Model and Algorithm
+3.1 Speculative Decoding Framework
+The speculative decoding algorithm consists of
+three main components:
+1. Speculative Generation:The approxima-
+tion modelM q generatesγcandidate tokens in
+parallel:x ′
+1, . . . , x′
+γ ∼q(·|x <t).
+2. Parallel Verification:The target
+modelM p is run on allγ+ 1positions in
+parallel to obtain probability distributions
+p(·|x<t), p(·|x<t, x′
+1), . . . , p(·|x<t, x′
+1, . . . , x′
+γ).
+3. Speculative Sampling:For each candidate
+tokenx ′
+i, we accept it with probability:
+αi = min
+
+1, p(x′
+i|x<t, x′
+<i)
+q(x′
+i|x<t, x′
+<i)
+
+(1)
+This ensures that the overall acceptance proba-
+bilityα= P
+x min(p(x), q(x))and the final out-
+put distribution matchesp(·)exactly.
+pcorr(x|x<t, x′
+<i) = p(x|x<t,x′
+<i)−min(p(x),q(x))
+1−P
+x′ min(p(x′),q(x′))
+(2)
+3.2 Expected Speedup
+The expected speedup factor depends on the ac-
+ceptance rateα, the number of speculative tokens
+γ, and the relative costc=C q/Cp of running the
+approximation model versus the target model. The
+theoretical speedup is:
+Speedup= 1 +γ
+1 +γ·c+ (1−α γ) (3)
+For typical configurations (e.g., T5-Small asMq
+and T5-XXL asM p withγ= 7), we expectα≈
+0.75andc≈0.02, yielding approximately 2.5–
+3×speedup.
+3.3 Implementation Approach
+We will implement the algorithm using PyTorch
+and the HuggingFace Transformers library to en-
+sure compatibility with existing model check-
+points. The implementation will include:
+• A modular architecture supporting any
+encoder-decoder (T5) or decoder-only
+(Gemma, Llama) Transformer model
+• Efficient parallel forward pass execution us-
+ing batched inference
+• Support for various sampling strategies (tem-
+perature, top-k, top-p)
+• Correctness verification to ensure output dis-
+tribution preservation
+• Comprehensive benchmarking tools for la-
+tency and throughput measurement
+4 Datasets
+We will evaluate the method on the following
+datasets:
+WMT’14 English-German Translation:
+Standard machine translation benchmark with
+4.5M training sentence pairs. We will use the
+standard test set (newstest2014) to measure
+translation quality (BLEU score) and inference
+speed.
+CNN/DailyMail Summarization:News arti-
+cle summarization dataset with 287K training ex-
+amples. We will evaluate on the standard test set
+using ROUGE scores and generation latency.
+LM1B (optional):One billion word language
+modeling benchmark for unconditional text gener-
+ation evaluation, if time permits.
+For each dataset, we will use pre-trained T5
+and Gemma models. Specifically, we will evalu-
+ate combinations such as T5-Small/T5-XXL and
+Gemma-2B/Gemma-7B (Google Team, 2024) to
+assess speedups across different scales. Fur-
+thermore, we will experiment with Med-Gemma
+(Google DeepMind, 2024) to specifically bench-
+mark performance in specialized domains where
+precision and low latency are equally critical. Our
+experiments will involve varying the speculative
+look-aheadγand measuring the resulting accep-
+tance rateαand overall wall-clock speedup across
+these diverse model architectures.
+5 Measurement of Success
+We will measure success using the following met-
+rics:
+Primary Metrics:
+•Speedup Factor:Ratio of baseline inference
+time to speculative decoding time, targeting
+2–3×as reported in the paper
+•Output Fidelity:KL divergence between
+output distributions of baseline and specula-
+tive decoding (target:<10 −6 to ensure iden-
+tical distributions)
+•Throughput:Tokens generated per second,
+measured on the same hardware
+Secondary Metrics:
+•Task Performance:BLEU score for trans-
+lation, ROUGE-L for summarization (should
+match baseline within 0.1 points)
+•Acceptance Rate (α):Percentage of spec-
+ulative tokens accepted, targeting>0.7for
+efficient operation
+•Computational Overhead:Additional
+FLOPs compared to baseline, measured via
+profiling
+Success criteria: (1) Achieve at least 1.5×
+speedup on at least one task, (2) Maintain
+output distribution fidelity (KL divergence<
+10−6), (3) Preserve task performance (within 0.5
+BLEU/ROUGE points of baseline).
+6 Future Additional Analysis
+Beyond the core implementation and evaluation,
+several additional analyses could provide deeper
+insights:
+1. Lenience Parameter Exploration:The pa-
+per introduces a lenience parameterl∈[0,1]
+that allows slight distribution changes for greater
+speedup. We could analyze the trade-off between
+speedup and distribution fidelity for differentlval-
+ues, potentially achieving 3–5×speedup with con-
+trolled distribution shifts.
+2. Optimal Approximation Model Selection:
+Investigate strategies for selecting the best ap-
+proximation model, including: (a) training task-
+specific small models, (b) using different archi-
+tectures (e.g., distilled models), and (c) dynamic
+model selection based on input difficulty.
+3. Temperature and Sampling Strategy
+Analysis:Explore how different temperature set-
+tings and sampling strategies (greedy, top-k, top-
+p) affect acceptance rates and speedup. The paper
+shows lower temperatures yield higher acceptance
+rates; we could quantify this relationship.
+4. Hardware-Specific Optimization:Analyze
+performance on different hardware configurations
+(single GPU, multi-GPU, TPU) and optimize the
+parallel execution strategy for each platform.
+5. Application to Beam Search:Extend the
+method to beam search decoding, which would re-
+quire verifying multiple candidate beams in par-
+allel and could provide even greater speedups for
+tasks requiring high-quality outputs.
+6. Comparison with Other Acceleration
+Methods:Conduct a comprehensive compari-
+son with quantization, knowledge distillation, and
+early-exit methods to understand when speculative
+decoding is most beneficial.
+7. Application to Med-Gemma:We will
+specifically investigate the potential of speculative
+decoding for accelerating Med-Gemma (Google
+DeepMind, 2024), a suite of large multimodal
+models for medicine. Given the high-stakes nature
+of medical diagnosis, reducing inference latency
+while maintaining exact output fidelity is crucial
+for clinical adoption. We will analyze how specu-
+lative decoding performs on medical visual ques-
+tion answering (VQA) and radiology report gener-
+ation tasks using Med-Gemma as the target model.
+Acknowledgments
+This project is based on the work of Leviathan et
+al. (Leviathan et al., 2022). We acknowledge the
+authors for their innovative approach to accelerat-
+ing Transformer inference.
+References
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie
+Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, Sandhini Agarwal, Ariel Herbert-V oss,
+Gretchen Krueger, Tom Henighan, Rewon Child,
+Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu,
+Clemens Winter, Christopher Hesse, Mark Chen,
+Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin
+Chess, Jack Clark, Christopher Berner, Sam Mc-
+Candlish, Alec Radford, Ilya Sutskever, and Dario
+Amodei. 2020. Language models are few-shot
+learners. InAdvances in Neural Information Pro-
+cessing Systems, volume 33, pages 1877–1901.
+John L. Hennessy and David A. Patterson. 2011.Com-
+puter Architecture: A Quantitative Approach. Mor-
+gan Kaufmann, 5th edition.
+Itay Hubara, Matthieu Courbariaux, Daniel Soudry,
+Ran El-Yaniv, and Yoshua Bengio. 2016. Quantized
+neural networks: Training neural networks with low
+precision weights and activations.Journal of Ma-
+chine Learning Research, 18(187):1–30.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+2022. Fast inference from transformers via specu-
+lative decoding.arXiv preprint arXiv:2211.17192.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine
+Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+Wei Li, and Peter J. Liu. 2020. Exploring the limits
+of transfer learning with a unified text-to-text trans-
+former.Journal of Machine Learning Research,
+21(140):1–67.
+Tal Schuster, Adam Fisch, and Regina Barzilay. 2021.
+Confident adaptive language modeling. InAdvances
+in Neural Information Processing Systems, volume
+34, pages 17456–17472.
+Romal Thoppilan, Daniel De Freitas, Jamie Hall,
+Noam Shazeer, Apoorv Kulshreshtha, Heng-Tze
+Cheng, Alicia Jin, Taylor Bos, Leslie Baker, Yu
+Du, YaGuang Li, Hongmin Wang, Shengzhong Liu,
+Xuezhi Wang, Yanqi Zhou, Denny Zhou, Claire
+Cui, and Quoc Le. 2022. LaMDA: Language
+models for dialog applications.arXiv preprint
+arXiv:2201.08239.
+Google DeepMind. 2024. Med-Gemma: Open Medi-
+cal AI Models.Google Research Blog.
+Google Gemma Team. 2024. Gemma 2: Improving
+Open Language Models at a Practical Size.arXiv
+preprint arXiv:2408.00118.

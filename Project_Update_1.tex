@@ -1,0 +1,92 @@
+\documentclass[11pt]{article}
+
+% This requires the ACL style packages (acl.sty) which are standard for ACL submissions.
+% If you do not have acl.sty locally, you can compile this on Overleaf using the standard ACL template.
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{hyperref}
+
+\title{Project Update 1: Fast Inference from Transformers \\ via Speculative Decoding}
+
+\author{Sai Shashank Mudliar \\
+  Purdue University \\
+  \texttt{smudliar@purdue.edu}
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Related Work}
+Large autoregressive Transformer models achieve state-of-the-art results but inherently suffer from slow inference. Decoding $K$ tokens requires $K$ serial forward passes, which is primarily constrained by memory bandwidth. Traditional approaches to accelerate inference---such as network quantization and weight pruning \cite{hubara2016quantized}---reduce computation but frequently degrade output quality and require architecture modifications. Adaptive computation \cite{schuster2021confident} dynamically allocates compute but still alters fundamental model behavior. 
+
+Speculative decoding \cite{leviathan2022fast} and modern extensions like EAGLE optimize inference by using draft models or feature-level extrapolations to generate candidate tokens which are then mathematically verified. While these fundamental works establish the theoretical framework and document speedups on standard discrete GPUs, they operate under the assumption that memory bandwidth is the universal primary bottleneck. \textbf{Our work differs from and extends this existing literature in three distinct ways:} First, we evaluate the system-level portability of these highly CUDA-dependent frameworks by actively patching and porting EAGLE to Apple Silicon. Second, we uniquely analyze speculative decoding under a Unified Memory Architecture (UMA). We provide novel empirical evidence that UMA's massive memory bandwidth eliminates the traditional bottleneck, causing the sequential overhead of draft generation to paradoxically \textit{decrease} overall throughput. Finally, we explicitly extend the evaluation to unexplored, state-of-the-art medical and highly optimized models like Med-Gemma and the Qwen family, providing critical hardware-agnostic validation not present in the original publications.
+
+\section{Methodology (Proposed Approach)}
+
+\paragraph{Speculative Decoding Framework:}
+Speculative decoding \cite{leviathan2022fast} accelerates inference by employing a smaller, efficient approximation model (the draft model) to generate multiple candidate tokens in parallel. These proposed tokens are then mathematically verified by the large target model in a single batched verification step using speculative sampling. Crucially, this algorithm guarantees that the final output distribution remains identical to the baseline model, avoiding any fidelity degradation. 
+
+Recent advancements, such as EAGLE (Extrapolation Algorithm for Greater Language-model Efficiency), highly optimize speculative decoding. Rather than relying on a completely separate, standalone draft model that predicts directly at the token level, EAGLE operates at the feature level. It uses a lightweight plug-in module on top of the base model's frozen layers to predict the next sequence of feature vectors (hidden states) and then applies the original language modeling head to generate the predicted tokens. This effectively leverages the base model's already learned features, vastly improving the acceptance rate of drafted tokens and dramatically minimizing drafting overhead.
+
+\paragraph{Methods Used So Far:}
+To empirically evaluate speculative decoding, we have successfully set up a local benchmarking framework built on PyTorch and the HuggingFace Transformers library. Thus far, we have implemented the following three end-to-end inference pipelines:
+\begin{enumerate}
+    \item \textbf{Vanilla LLM Pipeline:} Standard auto-regressive generation serving as our performance baseline.
+    \item \textbf{Vanilla Speculative Decoding:} Utilizing a dual-model approach where a smaller distinct draft network rapidly generates candidate tokens, followed by batched verification by the target network.
+    \item \textbf{EAGLE-3 Framework:} We integrated the state-of-the-art EAGLE approach, enabling feature-level speculative generation.
+\end{enumerate}
+
+Our initial environment was configured on an Apple Silicon machine utilizing Metal Performance Shaders (MPS). In order to adapt the original EAGLE framework to run locally on Mac, we made several architectural and codebase adjustments. We specifically patched hardcoded CUDA synchronizations (\texttt{torch.cuda.synchronize}) to be device-agnostic, and actively resolved specific RoPE scaling configuration mismatches to safely support modern model architectures.
+
+\section{Results}
+
+\subsection{Current Results}
+We performed our initial benchmarking on Apple Silicon (MPS). 
+
+\paragraph{Note on Model Selection:} While we initially proposed to evaluate Med-Gemma, we found that the Med-Gemma models were too computationally heavy and resource-intensive to efficiently run and benchmark on our local hardware constraints. Therefore, we pivoted to using the highly efficient Qwen model family for our current benchmarking experiments to reliably test the algorithms.
+
+We utilized \texttt{Qwen3-1.7B} as the target base model, \texttt{Qwen2.5-0.5B} as the draft model, and \texttt{AngelSlim/Qwen3-1.7B\_eagle3} for the respective EAGLE model architecture. Our current generation throughput is as follows:
+\begin{itemize}
+    \item \textbf{Vanilla LLM:} 44.17 tokens/sec
+    \item \textbf{Vanilla Speculative Decoding:} 30.38 tokens/sec
+    \item \textbf{EAGLE-3 Decoding:} 9.07 tokens/sec 
+\end{itemize}
+
+\subsection{Upcoming Results}
+Our next phase will transition our evaluation pipeline to CUDA-enabled environments. We will generate the planned metrics on WMT'14 En-De (translation) and CNN/DailyMail (summarization). Upcoming results will map the exact speedup scaling factors, the candidate acceptance rate ($\alpha$), and output fidelity constraints using standard T5 architectures and Gemma-based models (such as testing the originally planned Med-Gemma, if running on cloud GPUs provides sufficient VRAM).
+
+\subsection{Analysis and Ablation Studies Done}
+Our current metrics triggered an immediate ablation and analysis on architectural overhead:
+\begin{itemize}
+    \item \textbf{Memory Architecture Overhead:} Our current empirical results show that vanilla speculative decoding and EAGLE actually \textit{decreased} generation throughput. We deduce that Apple's Unified Memory Architecture (UMA) features such massive memory bandwidth that the traditional memory-access bottleneck is essentially eliminated. Consequently, the computational overhead of running the draft generation sequentially completely outweighs the parallel verification benefits on this specific hardware.
+    \item \textbf{Hardware-Specific Optimization:} We analyzed the EAGLE codebase and noted a severe drop in throughput caused by naive device synchronization. Heavily optimized frameworks rely on precise CUDA graphs and \texttt{torch.cuda.synchronize}; when ported to MPS, aggressive synchronization causes severe pipeline stalling, explaining the unexpected 9.07 tokens/s regression.
+\end{itemize}
+
+\subsection{Upcoming Analysis and Ablation Studies}
+Once migrated to a standard discrete GPU environment (NVIDIA/CUDA), our upcoming ablations will include:
+\begin{itemize}
+    \item Tracing the trade-off of the lenience parameter $l \in [0, 1]$ against distribution fidelity and empirical speedup.
+    \item Profiling the relationship between the speculative look-ahead size ($\gamma$) and the resulting acceptance rate ($\alpha$).
+    \item Comparing output generation matching/perplexity against baseline auto-regressive generation to comprehensively verify mathematically identical outputs.
+\end{itemize}
+
+\section{Problems Encountered and Project Direction Changes}
+
+\paragraph{Problems Encountered:} Our initial benchmarking schedule assumed that speculative decoding enhancements would provide a uniform wall-clock speedup across any hardware. However, executing the framework locally on a Mac demonstrated severe performance regressions. We discovered that state-of-the-art speculative libraries (e.g., EAGLE) are extremely fragile when removed from a CUDA environment. Furthermore, the originally proposed Med-Gemma model proved too heavy for local testing, requiring a necessary pivot to Qwen.
+
+\paragraph{Direction Change:} This hardware obstacle slightly shifts our project execution direction. While we proved we could successfully port and mathematically run the complex models structurally on MPS, we will migrate all primary benchmarking execution to a cloud-based NVIDIA GPU environment moving forward. To address hardware constraints and evaluate larger, complex models, we will connect to the Gilbreth Purdue Cluster for access to larger GPUs. Doing so will allow us to accurately measure the intended $2$--$3\times$ speedup outlined by \citet{leviathan2022fast} without the confounding variables of Apple Silicon's unique unified memory architecture and unsupported CUDA optimizations. We will also leverage this cloud environment to circle back to Med-Gemma if resources permit.
+
+\section{Repository and Implementation}
+All code setup, testing scripts, customized EAGLE codebase patches for MPS compatibility, benchmark methodology, and current results are tracked and available at: \\
+\textbf{GitHub Repository:} \url{https://github.com/your-username/your-repo} % Ensure to update this link
+
+% Entries for the entire Anthology, followed by custom entries
+\bibliography{custom}
+\bibliographystyle{acl_natbib}
+
+\end{document}

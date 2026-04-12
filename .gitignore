@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+ea_env/
+venv/
+.venv/
+
+# Model caches (very large)
+*.bin
+*.safetensors
+*.gguf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Compiled LaTeX output
+*.aux
+*.log
+*.bbl
+*.blg
+*.out
+*.toc
+*.synctex.gz
+
+# Zip archives (can be regenerated)
+*.zip
+
+# Docx (generated)
+*.docx
+
+# Temporary
+/tmp/

@@ -1,0 +1,240 @@
+\pdfoutput=1
+\documentclass[11pt]{article}
+
+\usepackage[preprint]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\title{Project Update 2: Fast Inference from Transformers \\ via Speculative Decoding --- Implementation and Evaluation}
+
+\author{Sai Shashank Mudliar \\
+  Purdue University \\
+  \texttt{smudliar@purdue.edu}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large autoregressive Transformer models achieve superior performance but suffer from slow inference, as decoding $K$ tokens requires $K$ serial forward passes. This project implements and evaluates speculative decoding, an algorithm that accelerates inference by using smaller approximation models to generate candidate tokens which are then verified by the target model. We compare three decoding strategies---vanilla autoregressive, vanilla speculative decoding with a separate draft model, and EAGLE-3 feature-level speculative decoding---on Apple Silicon (MPS) and analyze the hardware-dependent performance characteristics. Our initial results reveal that speculative decoding's effectiveness is highly dependent on the underlying memory architecture, providing novel empirical evidence that Unified Memory Architectures can negate the expected speedup. This update details our progress since the first update, including methodology refinements, experimental setup, current and upcoming results, and lessons learned.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Large autoregressive Transformer models such as GPT-3 \citep{brown2020language}, T5-XXL \citep{raffel2020exploring}, and LaMDA \citep{thoppilan2022lamda} have demonstrated remarkable capabilities across various natural language processing tasks. However, inference from these models is inherently slow because each token generation requires a sequential forward pass through the model. For a sequence of $K$ tokens, this results in $K$ serial model runs, making real-time applications challenging.
+
+Speculative decoding \citep{leviathan2023fast} offers a promising solution: it accelerates existing off-the-shelf models without retraining, maintains identical output distributions, and achieves substantial speedups ($2$--$3\times$ as demonstrated on T5-XXL). The key insight is that hard language modeling tasks often contain easier subtasks that can be approximated well by smaller, more efficient models. When memory bandwidth is the bottleneck rather than arithmetic operations, additional computational resources may be available for parallel execution---a principle borrowed from speculative execution in computer architecture \citep{hennessy2011computer}.
+
+In this project, we implement and evaluate speculative decoding across three distinct strategies: (1) vanilla autoregressive generation, (2) vanilla speculative decoding with a separate draft model, and (3) EAGLE-3 \citep{li2024eagle}, a state-of-the-art feature-level speculative method. Our work extends the existing literature in several key ways. First, we evaluate the cross-platform portability of CUDA-optimized speculative decoding frameworks by actively porting EAGLE to Apple Silicon's Metal Performance Shaders (MPS). Second, we provide novel empirical analysis of speculative decoding under a Unified Memory Architecture (UMA), demonstrating that the expected speedup assumptions do not hold when memory bandwidth is no longer a bottleneck. Third, we benchmark modern model families (Qwen) that are underrepresented in the original speculative decoding evaluations, and document the practical engineering challenges of deploying these systems outside of standard CUDA environments.
+
+%==============================================================================
+\section{Related Work}
+%==============================================================================
+
+\paragraph{Inference Acceleration.}
+Traditional approaches to accelerate Transformer inference include quantization \citep{hubara2017quantized}, knowledge distillation, and pruning. While effective at reducing computation, these methods frequently degrade output quality and require architecture modifications or model retraining. Adaptive computation methods \citep{schuster2021confident} dynamically allocate compute but alter the model architecture and do not guarantee identical output distributions.
+
+\paragraph{Speculative Decoding.}
+\citet{leviathan2023fast} introduced speculative decoding, which uses a smaller approximation model $M_q$ to speculatively generate $\gamma$ candidate tokens, subsequently verified in parallel by the target model $M_p$ using a novel speculative sampling technique. Concurrently, \citet{chen2023accelerating} proposed a similar approach termed speculative sampling. Both methods guarantee that the output distribution is mathematically identical to standard autoregressive decoding from $M_p$, distinguishing them from distillation-based methods. Earlier related ideas include blockwise parallel decoding \citep{stern2018blockwise}, though without the formal distribution-preserving guarantees.
+
+\paragraph{EAGLE Framework.}
+The EAGLE family of methods \citep{li2024eagle, li2024eagle2} fundamentally rethinks the draft model design. Rather than using a separate, standalone model for drafting, EAGLE operates at the \emph{feature level}: it trains a lightweight plug-in module on top of the base model's frozen hidden layers to predict future feature vectors (hidden states). The original language modeling head then converts these predicted features into token predictions. This design drastically improves acceptance rates by leveraging the base model's learned representations, reducing drafting overhead compared to traditional two-model approaches. EAGLE-2 further introduces dynamic draft trees for adaptive speculation depth.
+
+\paragraph{How Our Work Differs.}
+Existing speculative decoding evaluations \citep{leviathan2023fast, chen2023accelerating, li2024eagle} are conducted exclusively on NVIDIA GPUs where memory bandwidth is the dominant bottleneck. Our work extends this literature by: (1) systematically porting the EAGLE framework to a non-CUDA environment (Apple Silicon MPS), documenting the required patches and compatibility challenges; (2) providing the first empirical analysis of speculative decoding under a Unified Memory Architecture, where the bandwidth bottleneck assumption breaks down; and (3) benchmarking on the Qwen model family \citep{qwen2024}, which represents a newer generation of efficient decoder-only models not covered in the original evaluations. Our findings that speculative decoding can \textit{decrease} throughput under certain hardware configurations provide valuable practical guidance for deployment decisions.
+
+%==============================================================================
+\section{Methodology}
+%==============================================================================
+
+\subsection{Speculative Decoding Algorithm}
+
+The speculative decoding algorithm \citep{leviathan2023fast} consists of three main phases:
+
+\paragraph{Phase 1: Speculative Generation.}
+The approximation model $M_q$ autoregressively generates $\gamma$ candidate tokens: $x'_1, \ldots, x'_\gamma \sim q(\cdot|x_{<t})$. This is computationally cheap since $M_q$ is significantly smaller than $M_p$.
+
+\paragraph{Phase 2: Parallel Verification.}
+The target model $M_p$ processes all $\gamma + 1$ positions in a single batched forward pass, yielding probability distributions $p(\cdot|x_{<t}), p(\cdot|x_{<t}, x'_1), \ldots, p(\cdot|x_{<t}, x'_1, \ldots, x'_\gamma)$. This is the key efficiency insight: running $M_p$ on $\gamma+1$ tokens in parallel takes approximately the same wall-clock time as running it on a single token when the operation is memory-bandwidth bound.
+
+\paragraph{Phase 3: Speculative Sampling.}
+For each candidate token $x'_i$, we accept it with probability:
+\begin{equation}
+\alpha_i = \min\left(1, \frac{p(x'_i \mid x_{<t}, x'_{<i})}{q(x'_i \mid x_{<t}, x'_{<i})}\right)
+\label{eq:acceptance}
+\end{equation}
+If a token is rejected at position $i$, we resample from a corrected distribution:
+\begin{equation}
+p_{\text{corr}}(x) = \frac{\max(0,\; p(x) - q(x))}{\sum_{x'} \max(0,\; p(x') - q(x'))}
+\label{eq:correction}
+\end{equation}
+This rejection-then-correction mechanism formally guarantees that the output distribution matches $p(\cdot)$ exactly, regardless of the quality of $M_q$.
+
+The theoretical speedup factor is:
+\begin{equation}
+\text{Speedup} = \frac{1 + \gamma}{1 + \gamma \cdot c + (1 - \alpha^\gamma)}
+\label{eq:speedup}
+\end{equation}
+where $\alpha$ is the mean acceptance rate and $c = C_q / C_p$ is the relative cost ratio of $M_q$ to $M_p$.
+
+\subsection{EAGLE Feature-Level Speculation}
+
+EAGLE \citep{li2024eagle} replaces the independent draft model with a lightweight neural network module $f_\theta$ that takes the target model's hidden state $h_t$ at the current position and predicts the next hidden state:
+\begin{equation}
+\hat{h}_{t+1} = f_\theta(h_t, e(x_t))
+\label{eq:eagle}
+\end{equation}
+where $e(x_t)$ is the token embedding. The predicted hidden state $\hat{h}_{t+1}$ is then passed through the frozen language modeling head of $M_p$ to produce token-level predictions. This feature-level approach yields much higher acceptance rates than separate draft models because the predictions are grounded in the target model's own internal representations.
+
+\subsection{Implementation Details}
+
+We implement three inference pipelines using PyTorch and HuggingFace Transformers:
+\begin{enumerate}
+    \item \textbf{Vanilla LLM:} Standard greedy autoregressive decoding via \texttt{model.generate()} with \texttt{do\_sample=False}.
+    \item \textbf{Vanilla Speculative Decoding:} Uses HuggingFace's built-in \texttt{assistant\_model} parameter, pairing a large target model with a smaller draft model from a different model family.
+    \item \textbf{EAGLE-3:} Integration of the open-source EAGLE framework with pre-trained EAGLE weights, using \texttt{EaModel.from\_pretrained()} and the \texttt{eagenerate()} inference method.
+\end{enumerate}
+
+\paragraph{MPS Portability Patches.}
+Adapting EAGLE to Apple Silicon required five categories of modifications to the EAGLE codebase:
+\begin{itemize}
+    \item Replacing all \texttt{torch.cuda.synchronize()} calls in the model loading pipeline (\texttt{ea\_model.py}) with a device-agnostic \texttt{\_sync()} helper that dispatches to \texttt{torch.mps.synchronize()} on Apple Silicon.
+    \item Fixing \texttt{KeyError: 'type'} in RoPE (Rotary Position Embedding) scaling initialization in \texttt{cnets.py} by using \texttt{.get()} with fallbacks for both the \texttt{type} and \texttt{rope\_type} keys.
+    \item Adding a handler for the \texttt{``default''} RoPE scaling type, which newer Qwen models use but the original EAGLE codebase did not recognize.
+    \item Patching \texttt{modeling\_qwen3\_kv.py} to define a dummy \texttt{LossKwargs} class removed in newer \texttt{transformers} versions, and commenting out \texttt{\_tied\_weights\_keys} to resolve initialization errors.
+    \item Providing explicit fallback RoPE initialization logic when \texttt{ROPE\_INIT\_FUNCTIONS} lookups fail.
+\end{itemize}
+
+%==============================================================================
+\section{Experimental Setup}
+%==============================================================================
+
+\subsection{Models}
+Due to hardware constraints (see Section~\ref{sec:problems}), we pivoted from our originally proposed Med-Gemma \citep{medgemma2024} models to the Qwen family \citep{qwen2024}, which provides efficient, high-quality models at manageable sizes:
+\begin{itemize}
+    \item \textbf{Target Model:} \texttt{Qwen/Qwen3-1.7B} (1.7B parameters)
+    \item \textbf{Draft Model:} \texttt{Qwen/Qwen2.5-0.5B} (0.5B parameters) for vanilla speculative decoding
+    \item \textbf{EAGLE Model:} \texttt{AngelSlim/Qwen3-1.7B\_eagle3} (EAGLE-3 weights for Qwen3-1.7B)
+\end{itemize}
+All models are loaded in \texttt{float16} precision with \texttt{device\_map} set to the target accelerator.
+
+\subsection{Hardware}
+Current experiments are conducted on Apple Silicon with Metal Performance Shaders (MPS) as the compute backend. This represents a Unified Memory Architecture where CPU and GPU share the same high-bandwidth memory pool.
+
+\subsection{Evaluation Protocol}
+For each decoding method, we: (1) perform a warmup generation of 10 tokens, (2) generate 100 new tokens using greedy decoding (\texttt{temperature=0}), and (3) measure wall-clock time and compute tokens per second. The input prompt is held constant across all methods: \textit{``Explain the theory of relativity in detail.''} Memory is cleared between model loads using \texttt{gc.collect()} and \texttt{torch.mps.empty\_cache()} to prevent out-of-memory errors.
+
+%==============================================================================
+\section{Results}
+%==============================================================================
+
+\subsection{Current Results}
+
+Table~\ref{tab:results} summarizes our benchmarking results on Apple Silicon (MPS).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Tokens/sec} & \textbf{Relative} \\
+\midrule
+Vanilla LLM & 44.17 & 1.00$\times$ \\
+Vanilla Speculative & 30.38 & 0.69$\times$ \\
+EAGLE-3 & 9.07 & 0.21$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Generation throughput on Apple Silicon (MPS) with Qwen3-1.7B. Speculative methods show \textit{slowdowns} rather than speedups due to the Unified Memory Architecture.}
+\label{tab:results}
+\end{table}
+
+Contrary to the expected $2$--$3\times$ speedup, both speculative decoding variants are \textit{slower} than vanilla autoregressive generation on this hardware. The vanilla speculative method achieves only $0.69\times$ the baseline throughput, while EAGLE-3 achieves only $0.21\times$.
+
+\subsection{Analysis and Ablation Studies Completed}
+
+\paragraph{UMA Bottleneck Analysis.}
+The fundamental assumption of speculative decoding is that inference is \emph{memory-bandwidth bound}: running the target model on $\gamma+1$ tokens in parallel takes roughly the same time as a single token because the bottleneck is loading model weights from memory, not the arithmetic. However, Apple Silicon's Unified Memory Architecture provides extremely high memory bandwidth (up to 400 GB/s on M-series chips) shared between CPU and GPU. This effectively eliminates the bandwidth bottleneck, meaning the cost of the additional draft model computation is no longer ``free''---it adds genuine latency overhead.
+
+\paragraph{CUDA Dependency Analysis.}
+The EAGLE framework is heavily optimized for NVIDIA GPUs, relying on CUDA-specific synchronization primitives (\texttt{torch.cuda.synchronize()}) for precise timing during the auto-tuning phase (where it selects optimal \texttt{total\_token} from candidates $[40, 48, 50, 56, 60]$). When ported to MPS, these synchronization calls either fail or introduce excessive pipeline stalls, explaining the severe $0.21\times$ throughput degradation.
+
+\paragraph{Draft Model Architecture Mismatch.}
+For vanilla speculative decoding, we use \texttt{Qwen2.5-0.5B} as the draft model for a \texttt{Qwen3-1.7B} target. These are from different model generations (Qwen2.5 vs Qwen3), which likely reduces the acceptance rate $\alpha$ in Equation~\ref{eq:acceptance} compared to architecturally matched pairs, further degrading the speculative speedup.
+
+\subsection{Upcoming Results}
+Our next phase will:
+\begin{itemize}
+    \item Transition the evaluation pipeline to the Gilbreth Purdue Cluster with NVIDIA GPUs to obtain results under standard memory-bandwidth-bound conditions.
+    \item Evaluate on task-specific benchmarks: WMT'14 English-German (BLEU) and CNN/DailyMail (ROUGE-L).
+    \item Measure acceptance rate $\alpha$ and output fidelity (KL divergence between baseline and speculative outputs).
+\end{itemize}
+
+\subsection{Upcoming Ablation Studies}
+\begin{itemize}
+    \item \textbf{Speculative window $\gamma$:} Profile how varying the look-ahead window $\gamma \in \{1, 3, 5, 7, 10\}$ affects acceptance rate and throughput.
+    \item \textbf{Lenience parameter:} Trace the trade-off of the lenience parameter $l \in [0, 1]$ against distribution fidelity and empirical speedup.
+    \item \textbf{Hardware comparison:} Directly compare MPS vs. CUDA throughput for identical model configurations to isolate the architectural effect.
+    \item \textbf{Output fidelity:} Verify mathematically identical outputs by computing KL divergence between vanilla and speculative distributions (target: $< 10^{-6}$).
+\end{itemize}
+
+%==============================================================================
+\section{Progress Since Last Update}
+%==============================================================================
+
+Since Project Update~1, we have made the following progress:
+\begin{enumerate}
+    \item \textbf{Citation corrections:} Fixed all BibTeX citation keys and ensured proper \texttt{\\citep} / \texttt{\\citet} formatting throughout.
+    \item \textbf{Contribution clarification:} Added explicit differentiation of our work from existing literature (see Section~2, ``How Our Work Differs'').
+    \item \textbf{Methodology expansion:} Moved speculative decoding algorithmic details into the Methodology section (Section~3), including formal equations for acceptance probability, correction distribution, and the EAGLE feature prediction mechanism.
+    \item \textbf{Experimental Setup:} Added a dedicated Experimental Setup section (Section~4) with model specifications, hardware details, and evaluation protocol.
+    \item \textbf{Introduction:} Wrote a complete Introduction section (Section~1) framing the problem and our contributions.
+    \item \textbf{Results analysis:} Deepened the analysis of current results with formal discussion of UMA bottleneck effects, CUDA dependency impacts, and draft model mismatch effects.
+\end{enumerate}
+
+%==============================================================================
+\section{Ideas That Did Not Work}
+\label{sec:problems}
+%==============================================================================
+
+\paragraph{Med-Gemma Evaluation.}
+Our original proposal planned to evaluate speculative decoding on Med-Gemma \citep{medgemma2024} for medical NLP tasks. However, Med-Gemma models require significantly more GPU memory than available on our local hardware. The models could not be loaded even in \texttt{float16} precision on Apple Silicon with 16GB unified memory. We pivoted to the Qwen model family, which provides competitive quality at manageable sizes (0.5B--1.7B parameters).
+
+\paragraph{Direct EAGLE Port to MPS.}
+We initially attempted to run the EAGLE framework unmodified on MPS, expecting PyTorch's device abstraction to handle the CUDA-to-MPS translation. This failed immediately due to five distinct categories of incompatibilities (detailed in Section~3.3). While we successfully patched all issues, the resulting throughput was significantly worse than vanilla decoding, demonstrating that speculative decoding frameworks require hardware-specific optimization to be effective.
+
+\paragraph{Cross-Family Draft Models.}
+Using \texttt{Qwen2.5-0.5B} as a draft model for \texttt{Qwen3-1.7B} resulted in lower acceptance rates than expected. The architectural and training distribution differences between model generations reduce the approximation quality $q(\cdot) \approx p(\cdot)$, which is critical for speculative decoding efficiency.
+
+%==============================================================================
+\section{Next Steps}
+%==============================================================================
+
+\begin{enumerate}
+    \item \textbf{GPU cluster evaluation:} Migrate all benchmarks to the Gilbreth Purdue Cluster (NVIDIA A100/V100 GPUs) to validate expected $2$--$3\times$ speedups under standard conditions.
+    \item \textbf{Task-specific benchmarks:} Evaluate on WMT'14 En-De and CNN/DailyMail with BLEU and ROUGE metrics to measure task performance preservation.
+    \item \textbf{Acceptance rate profiling:} Instrument the speculative sampling loop to record per-token acceptance rates and analyze the relationship between $\alpha$, $\gamma$, and throughput.
+    \item \textbf{Same-family draft models:} Test with architecturally matched draft-target pairs (e.g., Qwen3-0.6B with Qwen3-1.7B) to improve acceptance rates.
+    \item \textbf{Hardware comparison study:} Run identical configurations on MPS and CUDA to produce a direct hardware comparison, quantifying the UMA effect.
+    \item \textbf{Med-Gemma revisit:} Attempt Med-Gemma evaluation on the Gilbreth cluster if sufficient VRAM is available.
+\end{enumerate}
+
+%==============================================================================
+\section{Repository}
+%==============================================================================
+
+All source code, benchmark scripts, EAGLE compatibility patches, and results are available at: \\
+\textbf{GitHub:} \url{https://github.com/your-username/speculative-decoding-eval}
+
+\noindent\textit{Note: Please replace the above with your actual repository URL before submission.}
+
+\bibliography{custom}
+\bibliographystyle{acl_natbib}
+
+\end{document}
