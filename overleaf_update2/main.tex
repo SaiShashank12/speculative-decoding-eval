@@ -210,8 +210,16 @@ Since Project Update~1, we have made the following progress:
 \label{sec:problems}
 %==============================================================================
 
-\paragraph{Med-Gemma Initial Attempt.}
-Our original proposal planned to evaluate speculative decoding on Med-Gemma \citep{medgemma2024} for medical NLP tasks. Initial attempts to load Med-Gemma failed due to gated repository access restrictions and dependency version conflicts. After resolving authentication and upgrading the HuggingFace pipeline, we successfully loaded and benchmarked \texttt{google/medgemma-4b-it} (4B parameters) on Apple Silicon MPS, achieving 20.47 tokens/sec. While Med-Gemma is now functional for vanilla inference, applying speculative decoding to it remains a challenge: no pre-trained EAGLE weights exist for Gemma-3-based architectures, and finding an appropriate smaller draft model within the same architecture family is an open problem we plan to address.
+\paragraph{Med-Gemma Domain Adaptation and Draft Head Training.}
+Our original proposal planned to evaluate speculative decoding on Med-Gemma \citep{medgemma2024} for medical NLP tasks. After resolving gated repository access and dependency conflicts, we successfully benchmarked \texttt{google/medgemma-4b-it} achieving 20.47 tokens/sec in vanilla inference mode on MPS. 
+
+However, applying EAGLE speculative decoding to Med-Gemma presented a profound challenge: the official EAGLE framework is hardcoded for LLaMA-based architectures, and no pre-trained draft heads exist for the Gemma-3 architecture. To overcome this, we successfully engineered a custom EAGLE draft head training pipeline from scratch. This required re-architecting the draft head layers to match Gemma-3's internal specifications:
+\begin{itemize}
+    \item Implementing \texttt{GemmaRMSNorm} to handle Gemma's specific scaling conventions.
+    \item Porting the RoPE implementation (\texttt{RotaryEmbedding}) and Grouped-Query Attention constraints to match Med-Gemma's 8 attention heads and 4 key-value heads.
+    \item Engineering a standalone training loop on CPU/MPS to bypass DeepSpeed's strict CUDA dependencies.
+\end{itemize}
+Our proof-of-concept training utilized a subset of medical question-answering data. Over 3 epochs of training to predict the subsequent hidden states, the draft head's SmoothL1 loss successfully converged from 3.41 to 1.61, while top-1 token prediction accuracy began climbing above 2.6\%. This demonstrates that the EAGLE autoregressive feature prediction paradigm is architecturally viable for domain-specific Gemma-3 foundation models.
 
 \paragraph{Direct EAGLE Port to MPS.}
 We initially attempted to run the EAGLE framework unmodified on MPS, expecting PyTorch's device abstraction to handle the CUDA-to-MPS translation. This failed immediately due to five distinct categories of incompatibilities (detailed in Section~3.3). While we successfully patched all issues, the resulting throughput was significantly worse than vanilla decoding, demonstrating that speculative decoding frameworks require hardware-specific optimization to be effective.
@@ -229,7 +237,7 @@ Using \texttt{Qwen2.5-0.5B} as a draft model for \texttt{Qwen3-1.7B} resulted in
     \item \textbf{Acceptance rate profiling:} Instrument the speculative sampling loop to record per-token acceptance rates and analyze the relationship between $\alpha$, $\gamma$, and throughput.
     \item \textbf{Same-family draft models:} Test with architecturally matched draft-target pairs (e.g., Qwen3-0.6B with Qwen3-1.7B) to improve acceptance rates.
     \item \textbf{Hardware comparison study:} Run identical configurations on MPS and CUDA to produce a direct hardware comparison, quantifying the UMA effect.
-    \item \textbf{Med-Gemma speculative decoding:} Investigate draft model candidates for Med-Gemma 4B (e.g., Gemma-3-1B or distilled variants) to enable speculative decoding benchmarks on a domain-specific medical model.
+    \item \textbf{Med-Gemma Draft Head Scaling:} Scale up the proof-of-concept Med-Gemma draft head training on the Gilbreth cluster using larger medical corpora (e.g., PubMedQA) and multi-GPU configurations to produce a production-ready medical speculative decoding model.
 \end{enumerate}
 
 %==============================================================================
